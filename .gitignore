@@ -1,0 +1,8 @@
+.env
+app.db
+chroma_db/
+uploads/
+__pycache__/
+*.pyc
+venv/
+.streamlit/secrets.toml
