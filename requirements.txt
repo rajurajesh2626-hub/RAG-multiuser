@@ -11,3 +11,5 @@ chromadb
 pypdf
 bcrypt
 sentence-transformers
+torch
+torchvision
