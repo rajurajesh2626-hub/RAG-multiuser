@@ -1,15 +1,18 @@
+from dotenv import load_dotenv
+load_dotenv()
 import streamlit as st
 import os
 
-# Streamlit Cloud la secrets use panna
-if "GROQ_API_KEY" in st.secrets:
-    os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
-if "JWT_SECRET" in st.secrets:
-    os.environ["JWT_SECRET"] = st.secrets["JWT_SECRET"]
-
-
-
-
+# Load secrets (works in all environments)
+try:
+    # Streamlit Cloud / local with secrets.toml
+    if "GROQ_API_KEY" in st.secrets:
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+    if "JWT_SECRET" in st.secrets:
+        os.environ["JWT_SECRET"] = st.secrets["JWT_SECRET"]
+except Exception:
+    # Render / other platforms (env vars already set)
+    pass
 import streamlit as st
 import os, shutil, sqlite3, bcrypt
 from datetime import datetime
