@@ -3,10 +3,10 @@ python-dotenv
 langchain
 langchain-community
 langchain-groq
-langchain-huggingface
 langchain-classic
 langchain-core
 langchain-text-splitters
+langchain-huggingface
 chromadb
 pypdf
 bcrypt
