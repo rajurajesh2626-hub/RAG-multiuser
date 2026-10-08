@@ -1,24 +1,26 @@
-from dotenv import load_dotenv
-load_dotenv()
 import streamlit as st
 import os
+import shutil
+import sqlite3
+import bcrypt
+from datetime import datetime
+from pathlib import Path
 
-# Load secrets (works in all environments)
+# ---------- SECRETS (Works: Local + Render + Streamlit Cloud) ----------
 try:
-    # Streamlit Cloud / local with secrets.toml
     if "GROQ_API_KEY" in st.secrets:
         os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
     if "JWT_SECRET" in st.secrets:
         os.environ["JWT_SECRET"] = st.secrets["JWT_SECRET"]
 except Exception:
-    # Render / other platforms (env vars already set)
     pass
-import streamlit as st
-import os, shutil, sqlite3, bcrypt
-from datetime import datetime
-from pathlib import Path
 
 from dotenv import load_dotenv
+load_dotenv()
+
+import warnings
+warnings.filterwarnings("ignore")
+
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import FastEmbedEmbeddings
@@ -28,25 +30,46 @@ from langchain_classic.memory import ConversationBufferMemory
 from langchain_classic.chains import ConversationalRetrievalChain
 from langchain_core.prompts import PromptTemplate
 
-load_dotenv()
-
+# ---------- CONFIG ----------
 DB_FILE = "app.db"
 CHROMA_DIR = "./chroma_db"
 UPLOAD_DIR = "./uploads"
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+
+# 🚨 FILE UPLOAD LIMIT
+MAX_FILE_SIZE_MB = 10
+MAX_FILES_PER_USER = 10
+
 os.makedirs(CHROMA_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------- INIT (once) ----------
+
+# ---------- PASSWORD ----------
+def hash_pw(password: str) -> str:
+    pwd_bytes = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_pw(password: str, hashed: str) -> bool:
+    try:
+        pwd_bytes = password.encode("utf-8")[:72]
+        return bcrypt.checkpw(pwd_bytes, hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+# ---------- MODELS (cached) ----------
 @st.cache_resource
 def init_models():
     embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
     return embeddings, llm
 
+
 embeddings, llm = init_models()
 
 
-# ---------- DB ----------
+# ---------- DATABASE ----------
 def init_db():
     con = sqlite3.connect(DB_FILE)
     con.executescript("""
@@ -63,27 +86,30 @@ def init_db():
             created_at TEXT NOT NULL
         );
     """)
-    con.commit(); con.close()
+    con.commit()
+    con.close()
+
 
 def db():
     con = sqlite3.connect(DB_FILE, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
-def hash_pw(p): return bcrypt.hashpw(p.encode()[:72], bcrypt.gensalt()).decode()
-def verify_pw(p, h):
-    try: return bcrypt.checkpw(p.encode()[:72], h.encode())
-    except: return False
-
 
 # ---------- RAG ----------
 def ingest_file(user_id, file_path):
-    docs = PyPDFLoader(file_path).load() if file_path.endswith(".pdf") \
-           else TextLoader(file_path, encoding="utf-8").load()
+    if file_path.endswith(".pdf"):
+        docs = PyPDFLoader(file_path).load()
+    else:
+        docs = TextLoader(file_path, encoding="utf-8").load()
+
     for d in docs:
         d.metadata["user_id"] = user_id
+        d.metadata["source_file"] = os.path.basename(file_path)
+
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
+
     Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
@@ -103,19 +129,23 @@ def ask(user_id, question, history):
         memory_key="chat_history", return_messages=True, output_key="answer"
     )
     for m in history:
-        (memory.chat_memory.add_user_message if m["role"]=="user"
-         else memory.chat_memory.add_ai_message)(m["content"])
+        if m["role"] == "user":
+            memory.chat_memory.add_user_message(m["content"])
+        else:
+            memory.chat_memory.add_ai_message(m["content"])
 
     strict_prompt = PromptTemplate.from_template(
         """You are a strict document-based assistant.
-Answer ONLY using the context below.
+Answer ONLY using the context provided below.
 If the answer is NOT in the context, respond EXACTLY with:
 "I don't have information about that in your documents."
+Do NOT use your own knowledge. Do NOT make up answers.
 
 Context:
 {context}
 
 Question: {question}
+
 Answer:"""
     )
     chain = ConversationalRetrievalChain.from_llm(
@@ -126,19 +156,23 @@ Answer:"""
         combine_docs_chain_kwargs={"prompt": strict_prompt},
     )
     result = chain.invoke({"question": question})
-    sources = [{"file": os.path.basename(d.metadata.get("source","?")),
-                "page": d.metadata.get("page")} for d in result["source_documents"]]
+    sources = [
+        {
+            "file": os.path.basename(d.metadata.get("source", "?")),
+            "page": d.metadata.get("page"),
+        }
+        for d in result["source_documents"]
+    ]
     return result["answer"], sources
 
 
 # ---------- STREAMLIT UI ----------
-st.set_page_config(page_title="RAG Chatbot", page_icon="🤖")
+st.set_page_config(page_title="RAG Chatbot", page_icon="🤖", layout="wide")
 init_db()
 
 st.title("🤖 RAG Chatbot")
 st.caption("Upload your docs and ask questions")
 
-# Session state
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -165,8 +199,10 @@ if st.session_state.user is None:
         if st.button("Register"):
             con = db()
             try:
-                con.execute("INSERT INTO users (username, password_hash) VALUES (?,?)",
-                            (u, hash_pw(p)))
+                con.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (?,?)",
+                    (u, hash_pw(p)),
+                )
                 con.commit()
                 st.success("Account created! Now login.")
             except sqlite3.IntegrityError:
@@ -175,26 +211,53 @@ if st.session_state.user is None:
 
     st.stop()
 
-# ---------- MAIN CHAT ----------
+
+# ---------- MAIN ----------
 user = st.session_state.user
 user_id = user["id"]
 
-# Sidebar
+# ---------- SIDEBAR ----------
 with st.sidebar:
     st.write(f"👤 **{user['username']}**")
     st.divider()
 
     st.subheader("📁 Upload documents")
-    uploaded = st.file_uploader("Choose PDF or TXT", type=["pdf", "txt"])
-    if uploaded:
+    st.caption(f"Max {MAX_FILE_SIZE_MB} MB per file • PDF, TXT")
+
+    uploaded_files = st.file_uploader(
+        "Choose PDF or TXT",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,   # ← MULTIPLE FILES
+    )
+
+    if uploaded_files:
+        # Check file count
         user_dir = os.path.join(UPLOAD_DIR, str(user_id))
         os.makedirs(user_dir, exist_ok=True)
-        dest = os.path.join(user_dir, uploaded.name)
-        with open(dest, "wb") as f:
-            f.write(uploaded.getbuffer())
-        with st.spinner("Embedding..."):
-            n = ingest_file(user_id, dest)
-        st.success(f"✅ {uploaded.name} ({n} chunks)")
+        existing_files = os.listdir(user_dir)
+
+        if len(existing_files) + len(uploaded_files) > MAX_FILES_PER_USER:
+            st.error(f"❌ Max {MAX_FILES_PER_USER} files allowed per user.")
+        else:
+            for uploaded in uploaded_files:
+                # Check size
+                if uploaded.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                    st.error(f"❌ {uploaded.name} too large. Max {MAX_FILE_SIZE_MB} MB.")
+                    continue
+
+                dest = os.path.join(user_dir, uploaded.name)
+
+                # Skip duplicates
+                if uploaded.name in existing_files:
+                    st.warning(f"⚠️ {uploaded.name} already uploaded.")
+                    continue
+
+                with open(dest, "wb") as f:
+                    f.write(uploaded.getbuffer())
+
+                with st.spinner(f"Embedding {uploaded.name}..."):
+                    n = ingest_file(user_id, dest)
+                st.success(f"✅ {uploaded.name} ({n} chunks)")
 
     st.divider()
     user_dir = os.path.join(UPLOAD_DIR, str(user_id))
@@ -203,12 +266,15 @@ with st.sidebar:
         st.subheader("📂 Your files")
         for f in files:
             st.write(f"• {f}")
+    else:
+        st.caption("No files uploaded yet")
 
     st.divider()
     if st.button("🧹 Clear chat"):
         con = db()
         con.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
-        con.commit(); con.close()
+        con.commit()
+        con.close()
         st.session_state.messages = []
         st.rerun()
 
@@ -216,47 +282,53 @@ with st.sidebar:
         st.session_state.user = None
         st.rerun()
 
-# Chat history
+
+# ---------- CHAT ----------
 if "messages" not in st.session_state:
     con = db()
     rows = con.execute(
         "SELECT role, content FROM messages WHERE user_id=? ORDER BY id",
-        (user_id,)
+        (user_id,),
     ).fetchall()
     con.close()
-    st.session_state.messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+    st.session_state.messages = [
+        {"role": r["role"], "content": r["content"]} for r in rows
+    ]
 
-# Display chat
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# Input
 if prompt := st.chat_input("Ask a question..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # Save user message
     con = db()
-    con.execute("INSERT INTO messages (user_id, role, content, created_at) VALUES (?,?,?,?)",
-                (user_id, "user", prompt, datetime.utcnow().isoformat()))
-    con.commit(); con.close()
+    con.execute(
+        "INSERT INTO messages (user_id, role, content, created_at) VALUES (?,?,?,?)",
+        (user_id, "user", prompt, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            history = [m for m in st.session_state.messages[:-1]]
+            history = st.session_state.messages[:-1]
             answer, sources = ask(user_id, prompt, history)
             st.write(answer)
             if sources:
                 with st.expander("📚 Sources"):
                     for i, s in enumerate(sources, 1):
-                        page = f" (p.{s['page']})" if s["page"] is not None else ""
+                        page = f" (p.{s['page']})" if s["page"] else ""
                         st.write(f"{i}. {s['file']}{page}")
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     con = db()
-    con.execute("INSERT INTO messages (user_id, role, content, created_at) VALUES (?,?,?,?)",
-                (user_id, "assistant", answer, datetime.utcnow().isoformat()))
-    con.commit(); con.close()
+    con.execute(
+        "INSERT INTO messages (user_id, role, content, created_at) VALUES (?,?,?,?)",
+        (user_id, "assistant", answer, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
